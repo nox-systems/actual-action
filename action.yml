@@ -1,0 +1,145 @@
+# The GitHub Action (README.md beside this file): the last step of the
+# job that builds and tests the repository. It installs the probe sandbox
+# when the runner's is too old, downloads the actual-action binary from
+# the release its VERSION file names, verifies it against the release's
+# checksum, and runs it in the checkout the job's own steps left behind.
+name: Actual
+description: Review a pull request by running it, as the last step of the job that builds and tests the repository
+author: Nox Systems
+
+inputs:
+  api-url:
+    description: Actual's API.
+    required: false
+    default: https://api.actual.ci
+  anthropic-api-key:
+    description: Your own Anthropic API key, which the review's model calls then use from the runner. Without one, they go through Actual's API, which calls the model with Actual's key.
+    required: false
+    default: ""
+  model:
+    description: The model the review calls, opus-5.5 or fable-5.1, or the full ids claude-opus-5-5 and claude-fable-5-1. Actual uses it only when your org allows the model, and otherwise reviews with the repository's model and says why in the comment. Empty means the repository's model.
+    required: false
+    default: ""
+  name:
+    description: The scope this step reviews in, such as web. Each scope has its own check run, actual / <name>, and its own section of the pull request's comment. Empty means the repository's one Actual step, whose check run is actual.
+    required: false
+    default: ""
+  paths:
+    description: Glob lines, one pattern each, such as web/**. The step reviews only changed files a pattern matches, and a pull request that changes none is skipped with a neutral check. Empty means every changed file.
+    required: false
+    default: ""
+  review:
+    description: once reviews each pull request once, and a later push again only when someone asks for a re-run; every-push reviews every push. Empty takes the repository's setting in Actual's console, which is once unless an owner changed it.
+    required: false
+    default: ""
+  version:
+    description: The release whose binary runs, such as v0.1.0. Empty means the release this commit of the action was built for, which its VERSION file names.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # why: probes run under bubblewrap 0.11.0 or later, whose overlays lay
+    # each tree out over the checkout's build outputs (docs/SANDBOX.md),
+    # and Ubuntu 24.04's archive has 0.9.0, so on a GitHub-hosted runner an
+    # older or missing one is replaced by the release built here. Ubuntu
+    # 24.04 also confines unprivileged user namespaces through AppArmor,
+    # which bubblewrap needs. A self-hosted runner keeps what a job installs
+    # and sets, so there the step changes nothing and checks both.
+    - name: Install the probe sandbox
+      shell: bash
+      run: |
+        set -euo pipefail
+        found="$(bwrap --version 2>/dev/null | awk '{print $2}' || true)"
+        recent() { [ -n "$found" ] && [ "$(printf '%s\n%s\n' 0.11.0 "$found" | sort -V | head -n 1)" = 0.11.0 ]; }
+        if [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]; then
+          if ! recent || ! bwrap --unshare-user --ro-bind / / true 2>/dev/null; then
+            echo "::error::Actual needs bubblewrap 0.11.0 or later on PATH and unprivileged user namespaces on this self-hosted runner, and found bubblewrap ${found:-none}"
+            exit 1
+          fi
+          if [ ! -c /dev/fuse ] || [ ! -r /dev/fuse ] || [ ! -w /dev/fuse ]; then
+            echo "::error::Actual needs a /dev/fuse this runner's user may open on this self-hosted runner, for the layer probes write the system through"
+            exit 1
+          fi
+          echo "actual: bubblewrap $found is on the runner"
+          exit 0
+        fi
+        if recent; then
+          echo "actual: bubblewrap $found is on the runner"
+        else
+          echo "actual: building bubblewrap 0.11.0, because the runner has ${found:-none}"
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends libcap-dev meson ninja-build pkg-config
+          curl -sSfL -o "$RUNNER_TEMP/bubblewrap.tar.xz" https://github.com/containers/bubblewrap/releases/download/v0.11.0/bubblewrap-0.11.0.tar.xz
+          echo "988fd6b232dafa04b8b8198723efeaccdb3c6aa9c1c7936219d5791a8b7a8646  $RUNNER_TEMP/bubblewrap.tar.xz" | sha256sum -c -
+          rm -rf "$RUNNER_TEMP/bubblewrap"
+          mkdir "$RUNNER_TEMP/bubblewrap"
+          tar -xJf "$RUNNER_TEMP/bubblewrap.tar.xz" -C "$RUNNER_TEMP/bubblewrap" --strip-components=1
+          meson setup "$RUNNER_TEMP/bubblewrap/build" "$RUNNER_TEMP/bubblewrap" --prefix=/usr/local -Dman=disabled -Dtests=false -Dselinux=disabled -Dbash_completion=disabled -Dzsh_completion=disabled
+          meson compile -C "$RUNNER_TEMP/bubblewrap/build"
+          sudo meson install -C "$RUNNER_TEMP/bubblewrap/build"
+        fi
+        if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ]; then
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        fi
+
+    # why the release's checksum: the archive is fetched over the network
+    # into the job that holds the repository's credentials, and a download
+    # that does not match what the release published must never run.
+    #
+    # why the committed file: a workflow names the action by a moving tag
+    # (`@v0`) or by a commit, and neither names a release, so the release
+    # built from this commit is written in the action's own VERSION file.
+    #
+    # why musl: the release builds each Linux binary static against musl,
+    # so it runs whatever glibc the runner's image carries.
+    - name: Download Actual
+      shell: bash
+      env:
+        ACTUAL_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        version="${ACTUAL_VERSION:-$(cat "$GITHUB_ACTION_PATH/VERSION")}"
+        case "$(uname -s)/$(uname -m)" in
+          Linux/x86_64) triple=x86_64-unknown-linux-musl ;;
+          Linux/aarch64) triple=aarch64-unknown-linux-musl ;;
+          *)
+            echo "::error::Actual runs on Linux runners, x86_64 or aarch64, and this one is $(uname -s) $(uname -m)"
+            exit 1
+            ;;
+        esac
+        release="https://github.com/nox-systems/actual-action/releases/download/$version"
+        archive="actual-action-$triple.tar.xz"
+        dir="$RUNNER_TEMP/actual-bin"
+        rm -rf "$dir"
+        mkdir -p "$dir"
+        curl -sSfL --retry 4 --retry-all-errors --retry-delay 2 -o "$dir/$archive" "$release/$archive"
+        curl -sSfL --retry 4 --retry-all-errors --retry-delay 2 -o "$dir/$archive.sha256" "$release/$archive.sha256"
+        expected="$(grep -oE '^[0-9a-f]{64}' "$dir/$archive.sha256" | head -n 1 || true)"
+        actual="$(sha256sum "$dir/$archive" | cut -d ' ' -f 1)"
+        if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+          echo "::error::the downloaded $archive does not match the checksum release $version published"
+          exit 1
+        fi
+        tar -xJf "$dir/$archive" -C "$dir" --strip-components=1
+        ran="$("$dir/actual-action" --version)"
+        if [ "$ran" != "actual-action ${version#v}" ]; then
+          echo "::error::release $version holds $ran"
+          exit 1
+        fi
+        echo "actual: $ran"
+
+    - name: Review
+      shell: bash
+      env:
+        ACTUAL_API_URL: ${{ inputs.api-url }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        ACTUAL_REQUESTED_MODEL: ${{ inputs.model }}
+        ACTUAL_SCOPE: ${{ inputs.name }}
+        ACTUAL_PATHS: ${{ inputs.paths }}
+        ACTUAL_REVIEW: ${{ inputs.review }}
+        # why the job's check run id: a re-run of the scope runs this job
+        # again through the Actions API, and a job's id is its check run's.
+        ACTUAL_JOB_CHECK_RUN_ID: ${{ job.check_run_id }}
+      run: '"$RUNNER_TEMP/actual-bin/actual-action"'
