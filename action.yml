@@ -3,6 +3,12 @@
 # when the runner's is too old, downloads the actual-action binary from
 # the release its VERSION file names, verifies it against the release's
 # checksum, and runs it in the checkout the job's own steps left behind.
+#
+# The action fails open on Actual's own errors: a release that cannot be
+# downloaded or does not verify, or an API that cannot be reached or
+# fails, ends the step with exit 0 and one warning annotation, and the
+# review posts nothing. A cause in the job's own configuration or runner,
+# which only the repository's owners can fix, fails the step.
 name: Actual
 description: Review a pull request by running it, as the last step of the job that builds and tests the repository
 author: Nox Systems
@@ -47,12 +53,24 @@ runs:
     # 24.04 also confines unprivileged user namespaces through AppArmor,
     # which bubblewrap needs. A self-hosted runner keeps what a job installs
     # and sets, so there the step changes nothing and checks both.
+    #
+    # why a warning and exit 0 when the build fails on a GitHub-hosted
+    # runner: Actual chose to build bubblewrap there, and its owners cannot
+    # change the runner, so a download or a build that fails is Actual's. A
+    # self-hosted runner without bubblewrap or /dev/fuse is its owners' to
+    # fix, and fails the step.
     - name: Install the probe sandbox
+      id: sandbox
       shell: bash
       run: |
         set -euo pipefail
         found="$(bwrap --version 2>/dev/null | awk '{print $2}' || true)"
         recent() { [ -n "$found" ] && [ "$(printf '%s\n%s\n' 0.11.0 "$found" | sort -V | head -n 1)" = 0.11.0 ]; }
+        skip() {
+          echo "::warning title=Actual skipped this review::The review posted nothing, because $1."
+          echo "ready=false" >>"$GITHUB_OUTPUT"
+          exit 0
+        }
         if [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]; then
           if ! recent || ! bwrap --unshare-user --ro-bind / / true 2>/dev/null; then
             echo "::error::Actual needs bubblewrap 0.11.0 or later on PATH and unprivileged user namespaces on this self-hosted runner, and found bubblewrap ${found:-none}"
@@ -63,26 +81,32 @@ runs:
             exit 1
           fi
           echo "actual: bubblewrap $found is on the runner"
+          echo "ready=true" >>"$GITHUB_OUTPUT"
           exit 0
         fi
+        build() {
+          sudo apt-get update -q &&
+            sudo apt-get install -y -q --no-install-recommends libcap-dev meson ninja-build pkg-config &&
+            curl -sSfL --retry 4 --retry-all-errors --retry-delay 2 --connect-timeout 30 --max-time 300 -o "$RUNNER_TEMP/bubblewrap.tar.xz" https://github.com/containers/bubblewrap/releases/download/v0.11.0/bubblewrap-0.11.0.tar.xz &&
+            echo "988fd6b232dafa04b8b8198723efeaccdb3c6aa9c1c7936219d5791a8b7a8646  $RUNNER_TEMP/bubblewrap.tar.xz" | sha256sum -c - &&
+            rm -rf "$RUNNER_TEMP/bubblewrap" &&
+            mkdir "$RUNNER_TEMP/bubblewrap" &&
+            tar -xJf "$RUNNER_TEMP/bubblewrap.tar.xz" -C "$RUNNER_TEMP/bubblewrap" --strip-components=1 &&
+            meson setup "$RUNNER_TEMP/bubblewrap/build" "$RUNNER_TEMP/bubblewrap" --prefix=/usr/local -Dman=disabled -Dtests=false -Dselinux=disabled -Dbash_completion=disabled -Dzsh_completion=disabled &&
+            meson compile -C "$RUNNER_TEMP/bubblewrap/build" &&
+            sudo meson install -C "$RUNNER_TEMP/bubblewrap/build"
+        }
         if recent; then
           echo "actual: bubblewrap $found is on the runner"
         else
           echo "actual: building bubblewrap 0.11.0, because the runner has ${found:-none}"
-          sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends libcap-dev meson ninja-build pkg-config
-          curl -sSfL -o "$RUNNER_TEMP/bubblewrap.tar.xz" https://github.com/containers/bubblewrap/releases/download/v0.11.0/bubblewrap-0.11.0.tar.xz
-          echo "988fd6b232dafa04b8b8198723efeaccdb3c6aa9c1c7936219d5791a8b7a8646  $RUNNER_TEMP/bubblewrap.tar.xz" | sha256sum -c -
-          rm -rf "$RUNNER_TEMP/bubblewrap"
-          mkdir "$RUNNER_TEMP/bubblewrap"
-          tar -xJf "$RUNNER_TEMP/bubblewrap.tar.xz" -C "$RUNNER_TEMP/bubblewrap" --strip-components=1
-          meson setup "$RUNNER_TEMP/bubblewrap/build" "$RUNNER_TEMP/bubblewrap" --prefix=/usr/local -Dman=disabled -Dtests=false -Dselinux=disabled -Dbash_completion=disabled -Dzsh_completion=disabled
-          meson compile -C "$RUNNER_TEMP/bubblewrap/build"
-          sudo meson install -C "$RUNNER_TEMP/bubblewrap/build"
+          build || skip "bubblewrap 0.11.0 could not be built on this GitHub-hosted runner"
         fi
         if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ]; then
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 ||
+            skip "AppArmor's restriction on user namespaces could not be lifted on this GitHub-hosted runner"
         fi
+        echo "ready=true" >>"$GITHUB_OUTPUT"
 
     # why the release's checksum: the archive is fetched over the network
     # into the job that holds the repository's credentials, and a download
@@ -94,7 +118,14 @@ runs:
     #
     # why musl: the release builds each Linux binary static against musl,
     # so it runs whatever glibc the runner's image carries.
+    #
+    # why a warning and exit 0 when the download fails or does not verify:
+    # the release is Actual's, and the binary never runs either way. The
+    # one failure that is the job's own is a `version` input naming a
+    # release that does not exist, which only the workflow can change.
     - name: Download Actual
+      id: download
+      if: steps.sandbox.outputs.ready == 'true'
       shell: bash
       env:
         ACTUAL_VERSION: ${{ inputs.version }}
@@ -114,23 +145,55 @@ runs:
         dir="$RUNNER_TEMP/actual-bin"
         rm -rf "$dir"
         mkdir -p "$dir"
-        curl -sSfL --retry 4 --retry-all-errors --retry-delay 2 -o "$dir/$archive" "$release/$archive"
-        curl -sSfL --retry 4 --retry-all-errors --retry-delay 2 -o "$dir/$archive.sha256" "$release/$archive.sha256"
+        skip() {
+          echo "::warning title=Actual skipped this review::The review posted nothing, because $1."
+          echo "ready=false" >>"$GITHUB_OUTPUT"
+          exit 0
+        }
+        # why no --fail: curl then retries a server error or a dropped
+        # connection, never a 404, and answers the final status, which
+        # tells a release that does not exist from one that did not arrive.
+        # why curl's own exit status: 2 is a curl too old for these options,
+        # and 60 and 77 a runner without the trust roots to check GitHub's
+        # certificate, which are the runner's to fix, where any other means
+        # the release did not arrive.
+        fetch() {
+          local status code=0
+          status="$(curl -sSL --retry 4 --retry-all-errors --retry-delay 2 --connect-timeout 30 --max-time 300 -o "$2" -w '%{http_code}' "$1")" || code=$?
+          case "$code" in
+            0) ;;
+            2 | 60 | 77)
+              echo "::error::curl on this runner could not download Actual's release (curl exit status $code): it needs curl 7.71.0 or later and the trust roots to check GitHub's certificate"
+              exit 1
+              ;;
+            *) skip "$1 did not answer (curl exit status $code)" ;;
+          esac
+          if [ "$status" = 200 ]; then
+            return 0
+          fi
+          if [ "$status" = 404 ] && [ -n "$ACTUAL_VERSION" ]; then
+            echo "::error::the version input names $version, and nox-systems/actual-action has no release $version for this runner"
+            exit 1
+          fi
+          skip "$1 answered $status"
+        }
+        fetch "$release/$archive" "$dir/$archive"
+        fetch "$release/$archive.sha256" "$dir/$archive.sha256"
         expected="$(grep -oE '^[0-9a-f]{64}' "$dir/$archive.sha256" | head -n 1 || true)"
         actual="$(sha256sum "$dir/$archive" | cut -d ' ' -f 1)"
         if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
-          echo "::error::the downloaded $archive does not match the checksum release $version published"
-          exit 1
+          skip "the downloaded $archive does not match the checksum release $version published"
         fi
-        tar -xJf "$dir/$archive" -C "$dir" --strip-components=1
-        ran="$("$dir/actual-action" --version)"
+        tar -xJf "$dir/$archive" -C "$dir" --strip-components=1 || skip "the downloaded $archive did not unpack"
+        ran="$("$dir/actual-action" --version)" || skip "the downloaded actual-action did not run"
         if [ "$ran" != "actual-action ${version#v}" ]; then
-          echo "::error::release $version holds $ran"
-          exit 1
+          skip "release $version holds $ran"
         fi
         echo "actual: $ran"
+        echo "ready=true" >>"$GITHUB_OUTPUT"
 
     - name: Review
+      if: steps.download.outputs.ready == 'true'
       shell: bash
       env:
         ACTUAL_API_URL: ${{ inputs.api-url }}
@@ -142,4 +205,16 @@ runs:
         # why the job's check run id: a re-run of the scope runs this job
         # again through the Actions API, and a job's id is its check run's.
         ACTUAL_JOB_CHECK_RUN_ID: ${{ job.check_run_id }}
-      run: '"$RUNNER_TEMP/actual-bin/actual-action"'
+      # why every other status a warning: the binary exits 1 for a cause
+      # in the job's own configuration or runner, and any other status,
+      # such as a crash's 101, is Actual's own failure.
+      run: |
+        status=0
+        "$RUNNER_TEMP/actual-bin/actual-action" || status=$?
+        case "$status" in
+          0 | 1) exit "$status" ;;
+          *)
+            echo "::warning title=Actual skipped this review::The review posted nothing, because Actual's binary stopped with exit status $status."
+            exit 0
+            ;;
+        esac

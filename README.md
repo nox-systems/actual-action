@@ -36,13 +36,16 @@ following:
 - `persist-credentials: false` keeps the job's token out of `.git`. The
   review extracts the trees without `.git` either way.
 - `id-token: write` lets the job request the OIDC token that the action
-  exchanges for a run token. Without it, the action prints one line and
-  exits 0.
+  exchanges for a run token. Without it, the step fails with one line
+  that names the permission.
 - The action needs no other permission, because it never uses the job's
   GitHub token: Actual reads the pull request through its GitHub App.
 
 A pull request from a fork gets no OIDC token, so the action prints one
-line and exits 0, and the pull request's checks stay green.
+line and exits 0, and the pull request's checks stay green. It does the
+same for a job Dependabot started that GitHub gave no token, and for a
+job whose event is not a pull request, such as a push to your default
+branch.
 
 ### The model
 
@@ -216,6 +219,42 @@ jobs:
     timeout-minutes: 50
 ```
 
+### When Actual fails
+
+The action fails open on Actual's own errors. When a review cannot run
+or post because of Actual's side, the step exits 0 and shows one warning
+annotation titled "Actual skipped this review", which says why. The
+review then posts nothing, and the job stays green. Actual's side covers
+its API when it cannot be reached, answers a server
+error after the action's retries, or refuses a request the action built.
+It also covers a release that does not download or verify, a bubblewrap
+build that fails on a GitHub-hosted runner, a crash of Actual's binary,
+and Actual's own pipeline. A call that fails in the middle of a review,
+such as a write of a record, does not stop it, and the review still
+posts.
+
+The step fails, with one line that says why, only for a cause in your
+own workflow or runner, because only you can fix it. The causes are the
+following:
+
+- The job has no `id-token: write` permission on a pull request from a
+  branch of your own repository.
+- The Actual GitHub App is not installed on the repository.
+- An input or a variable the job sets is invalid, such as `paths`, or
+  the `version` input names no release.
+- The runner is not Linux on x86_64 or aarch64, a self-hosted runner
+  lacks bubblewrap 0.11.0 or `/dev/fuse`, its curl is older than 7.71.0
+  or lacks the trust roots to check GitHub's certificate, or no
+  filesystem can hold the sandbox's layers.
+- The checkout lacks the history the review reads, git fails on it, or
+  the repository's `.actual/config.toml` or `.actual/recipe.toml` is
+  invalid.
+
+A job that has nothing to review prints one line and exits 0 with no
+warning. That is a job of an event other than `pull_request`, a job of a
+fork's pull request, a job Dependabot started that GitHub gave no token,
+and a review that a newer push or the pull request's close ended.
+
 ## What the action does
 
 The action is a composite of three steps:
@@ -227,11 +266,12 @@ The action is a composite of three steps:
    the step builds 0.11.0 from its release tarball, checked against its
    pinned sha256, and installs it under `/usr/local`. It also lifts
    Ubuntu 24.04's AppArmor restriction on unprivileged user namespaces,
-   which bubblewrap needs. A self-hosted runner keeps what a job changes,
-   so there the step installs and changes nothing. It checks for
-   bubblewrap 0.11.0 or later on `PATH`, for unprivileged user
-   namespaces, and for a `/dev/fuse` the runner's user may open, and fails
-   with one line naming what is missing.
+   which bubblewrap needs. A build that fails there skips the review with
+   a warning (see "When Actual fails" above). A self-hosted runner keeps
+   what a job changes, so there the step installs and changes nothing.
+   It checks for bubblewrap 0.11.0 or later on `PATH`, for unprivileged
+   user namespaces, and for a `/dev/fuse` the runner's user may open, and
+   fails with one line naming what is missing.
 2. It downloads the binary for the runner's architecture,
    `actual-action-x86_64-unknown-linux-musl.tar.xz` or
    `actual-action-aarch64-unknown-linux-musl.tar.xz`, from this
@@ -242,7 +282,9 @@ The action is a composite of three steps:
    statically against musl, so it runs whatever glibc the runner's image
    has. The step checks the download against the checksum the release
    publishes beside it, and the binary's version against the release's
-   name, before it runs anything.
+   name, before it runs anything. A download that fails or does not
+   verify skips the review with a warning (see "When Actual fails"
+   above).
 3. It runs the review in the checkout at `GITHUB_WORKSPACE`.
 
 The review learns how your repository builds and runs one test file,
