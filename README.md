@@ -96,6 +96,17 @@ probe runs in. The model is still the one your org chose. The review
 still finishes within the model budget per review your org sets, as
 every review does.
 
+When Anthropic refuses the key, or says its account cannot pay, the
+review asks the model nothing more and posts what it found. An account
+cannot pay when it has no credit, its billing failed, or it reached a
+spend limit you set or its tier's monthly cap. Each region the review
+did not check names the cause in the comment, and so does the `actual`
+check's title, as in "Actual checked nothing because the repository's
+own Anthropic account cannot pay for more calls". The check is neutral,
+and the step then fails with one line that says the same, because only
+you can replace the key or let its account pay (see "When Actual fails"
+below).
+
 ### When a pull request is reviewed
 
 Actual reviews a pull request once: the first push that is not a draft
