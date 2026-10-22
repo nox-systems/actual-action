@@ -255,8 +255,11 @@ following:
   the `version` input names no release.
 - The runner is not Linux on x86_64 or aarch64, a self-hosted runner
   lacks bubblewrap 0.11.0 or `/dev/fuse`, its curl is older than 7.71.0
-  or lacks the trust roots to check GitHub's certificate, or no
-  filesystem can hold the sandbox's layers.
+  or lacks the trust roots to check GitHub's certificate, its git is
+  older than 2.41.0, or no filesystem can hold the sandbox's layers. The
+  review reads the diff with git's `--attr-source`, so the pull
+  request's own `.gitattributes` cannot change how git prints it, and
+  git added that option in 2.41.0.
 - The checkout lacks the history the review reads, git fails on it, or
   the repository's `.actual/config.toml` or `.actual/recipe.toml` is
   invalid.
