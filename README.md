@@ -302,8 +302,9 @@ The action is a composite of three steps:
 3. It runs the review in the checkout at `GITHUB_WORKSPACE`.
 
 The review learns how your repository builds and runs one test file,
-proves it with four handshake probes on each side, and then writes and
-runs probes against the merge base and the head. It reads both trees from
+proves it with four handshake probes on each side, and keeps it, so
+later reviews take it as stored. Each review then builds both sides and
+writes and runs probes against the merge base and the head. It reads both trees from
 the checkout's repository and lays the checkout's ignored directories
 under each, so each side sees the dependencies and build outputs your
 steps produced. It downloads no artifact. The comment's first line cites
